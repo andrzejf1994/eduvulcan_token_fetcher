@@ -119,6 +119,7 @@ async def fetch_new_token(login: str, password: str):
             # 1) Idziemy na /api/ap (backend przekieruje na /logowanie jeśli trzeba)
             LOGGER.info("Opening: %s", EDUVULCAN_URL)
             await page.goto(EDUVULCAN_URL, wait_until="networkidle")
+            await remove_privacy_overlay(page)
 
             # Usuń overlay cookies (jeśli jest)
             await page.evaluate("""
@@ -143,11 +144,13 @@ async def fetch_new_token(login: str, password: str):
                     context = await browser.new_context()
                     page = await context.new_page()
                     await page.goto(EDUVULCAN_URL, wait_until="networkidle")
+                    await remove_privacy_overlay(page)
 
                     await page.wait_for_selector("#Alias", timeout=30000)
 
                 # Krok 1: login
                 await page.fill("#Alias", login)
+                await remove_privacy_overlay(page)
                 await page.click("#btNext")
 
                 # Krok 2: hasło
@@ -164,6 +167,7 @@ async def fetch_new_token(login: str, password: str):
                 except Exception:
                     pass
 
+                await remove_privacy_overlay(page)
                 await page.click("#btLogOn")
 
                 # Czekamy aż backend zwróci stronę z #ap
@@ -206,6 +210,22 @@ async def fetch_new_token(login: str, password: str):
         finally:
             await browser.close()
 
+async def remove_privacy_overlay(page):
+    await page.evaluate("""
+        // Usuń główny wrapper
+        const wrapper = document.getElementById("respect-privacy-wrapper");
+        if (wrapper) wrapper.remove();
+
+        // Usuń iframe jeśli nadal istnieje
+        const iframe = document.querySelector("iframe.cookie-frame");
+        if (iframe) iframe.remove();
+
+        // Na wszelki wypadek usuń wszelkie elementy z pointer-events: auto
+        document.querySelectorAll('[id*="privacy"], [class*="cookie"]').forEach(el => {
+            el.style.pointerEvents = 'none';
+            el.remove();
+        });
+    """)
 
 async def watchdog_loop(login: str, password: str):
     """
