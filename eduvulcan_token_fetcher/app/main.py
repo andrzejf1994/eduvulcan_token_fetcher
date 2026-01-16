@@ -90,16 +90,28 @@ async def fetch_new_token(login: str, password: str):
                 LOGGER.info("Active session detected – token available without login")
             except:
                 LOGGER.info("No active session – performing login flow")
-
+            
+                # Upewnij się, że jesteśmy faktycznie na stronie logowania
+                try:
+                    await page.wait_for_selector("#Alias", timeout=5000)
+                except:
+                    LOGGER.warning("Login form not detected – clearing context and retrying fresh login")
+            
+                    await context.close()
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.goto(EDUVULCAN_URL, wait_until="networkidle")
+            
+                    await page.wait_for_selector("#Alias", timeout=30000)
+            
                 # Krok 1: login
-                await page.wait_for_selector("#Alias", timeout=30000)
                 await page.fill("#Alias", login)
                 await page.click("#btNext")
-
+            
                 # Krok 2: hasło
                 await page.wait_for_selector("#Password", timeout=30000)
                 await page.fill("#Password", password)
-
+            
                 # Captcha (jeśli się pojawi)
                 try:
                     await page.wait_for_selector("#captcha", state="visible", timeout=5000)
@@ -109,12 +121,12 @@ async def fetch_new_token(login: str, password: str):
                     )
                 except:
                     pass
-
+            
                 await page.click("#btLogOn")
-
+            
                 # Czekamy aż backend zwróci stronę z #ap
                 await page.wait_for_selector("#ap", state="attached", timeout=60000)
-
+                
             # 3) Odczyt tokena z #ap (jedyna prawidłowa metoda)
             token_json = await page.eval_on_selector("#ap", "el => el.value")
             data = json.loads(token_json)
