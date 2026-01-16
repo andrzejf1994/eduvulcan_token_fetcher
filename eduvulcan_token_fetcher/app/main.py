@@ -6,9 +6,8 @@ import base64
 import logging
 import argparse
 import time
+import aiohttp
 from datetime import datetime, timezone
-from urllib.request import Request, urlopen
-from urllib.error import URLError
 
 from playwright.async_api import async_playwright
 
@@ -24,8 +23,12 @@ EDUVULCAN_URL = "https://eduvulcan.pl/api/ap"
 # Zapas przed wygaśnięciem JWT (sekundy)
 REFRESH_MARGIN = 300  # 5 minut
 
-# Maksymalna liczba prób odświeżenia w jednym cyklu
-MAX_REFRESH_ATTEMPTS = 5
+# Limit nieudanych prób odświeżenia
+MAX_REFRESH_FAILURES = 5
+
+# Dane do wysyłania persistent_notification
+HA_URL = os.getenv("HA_URL", "http://homeassistant:8123")
+HA_TOKEN = os.getenv("HA_TOKEN")  # token long-lived
 
 
 def decode_jwt_payload(jwt: str) -> dict:
@@ -60,36 +63,35 @@ def token_validity(token_data: dict):
         return False, 0, 0
 
 
-def send_persistent_notification(message: str, title: str = "EduVulcan Token Fetcher"):
-    """
-    Wysyła persistent notification do Home Assistant.
-    """
+async def send_persistent_notification(title: str, message: str):
+    if not HA_TOKEN:
+        LOGGER.error("HA_TOKEN is not set – cannot send persistent notification")
+        return
+
+    url = f"{HA_URL}/api/services/persistent_notification/create"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "title": title,
+        "message": message,
+        "notification_id": "eduvulcan_token_fetcher",
+    }
+
     try:
-        payload = json.dumps(
-            {
-                "title": title,
-                "message": message,
-            }
-        ).encode("utf-8")
-
-        req = Request(
-            "http://supervisor/core/api/services/persistent_notification/create",
-            data=payload,
-            headers={
-                "Authorization": "Bearer " + os.getenv("SUPERVISOR_TOKEN", ""),
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        with urlopen(req, timeout=10) as resp:
-            if resp.status != 200:
-                LOGGER.error("Failed to send notification, HTTP %s", resp.status)
-
-    except URLError as exc:
-        LOGGER.error("Failed to send persistent notification: %s", exc)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    LOGGER.error(
+                        "Failed to send persistent notification: %s %s",
+                        resp.status, text
+                    )
+                else:
+                    LOGGER.info("Persistent notification sent to Home Assistant")
     except Exception as exc:
-        LOGGER.error("Unexpected error while sending notification: %s", exc)
+        LOGGER.exception("Error sending persistent notification: %s", exc)
 
 
 async def fetch_new_token(login: str, password: str):
@@ -164,7 +166,7 @@ async def fetch_new_token(login: str, password: str):
                 # Czekamy aż backend zwróci stronę z #ap
                 await page.wait_for_selector("#ap", state="attached", timeout=60000)
 
-            # 3) Odczyt tokena z #ap (jedyna prawidłowa metoda)
+            # 3) Odczyt tokena z #ap
             token_json = await page.eval_on_selector("#ap", "el => el.value")
             data = json.loads(token_json)
 
@@ -178,7 +180,7 @@ async def fetch_new_token(login: str, password: str):
             if not tenant:
                 raise RuntimeError("Nie udało się odczytać tenant z JWT")
 
-            # 4) Zapis tokena do /config
+            # 4) Zapis tokena
             output = {
                 "tenant": tenant,
                 "jwt": jwt,
@@ -191,7 +193,7 @@ async def fetch_new_token(login: str, password: str):
                 json.dump(output, f, indent=2, ensure_ascii=False)
                 f.write("\n")
 
-            # 5) Zapis cookies / localStorage do /data
+            # 5) Zapis cookies / localStorage
             await context.storage_state(path=STORAGE_FILE)
 
             LOGGER.info("Token saved to: %s", TOKEN_FILE)
@@ -207,9 +209,11 @@ async def watchdog_loop(login: str, password: str):
     Tryb ciągły:
     - sprawdza exp JWT
     - odświeża tylko gdy trzeba
-    - limit 5 prób, potem persistent notification
+    - po 5 nieudanych próbach wysyła persistent notification i kończy
     """
     LOGGER.info("Starting JWT watchdog loop (refresh margin: %ss)", REFRESH_MARGIN)
+
+    failures = 0
 
     while True:
         token_data = read_saved_token()
@@ -217,6 +221,7 @@ async def watchdog_loop(login: str, password: str):
         if token_data:
             valid, exp, seconds_left = token_validity(token_data)
             if valid:
+                failures = 0  # reset licznika po poprawnym stanie
                 sleep_for = max(60, seconds_left - REFRESH_MARGIN)
                 exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
                 LOGGER.info(
@@ -227,27 +232,29 @@ async def watchdog_loop(login: str, password: str):
                 continue
 
         LOGGER.info("Token missing or expired – refreshing now...")
+        try:
+            await fetch_new_token(login, password)
+            failures = 0
+        except Exception as exc:
+            failures += 1
+            LOGGER.exception("Refresh failed (%s/%s): %s", failures, MAX_REFRESH_FAILURES, exc)
 
-        success = False
+            if failures >= MAX_REFRESH_FAILURES:
+                msg = (
+                    f"Nie udało się odświeżyć tokena eduVULCAN po {MAX_REFRESH_FAILURES} próbach.\n\n"
+                    f"Ostatni błąd: {exc}\n\n"
+                    "Sprawdź poprawność loginu/hasła lub zmiany w stronie logowania."
+                )
+                await send_persistent_notification(
+                    "EduVULCAN – błąd odświeżania tokena",
+                    msg,
+                )
+                LOGGER.error("Max refresh failures reached – stopping watchdog")
+                return 1
 
-        for attempt in range(1, MAX_REFRESH_ATTEMPTS + 1):
-            try:
-                LOGGER.info("Refresh attempt %s/%s", attempt, MAX_REFRESH_ATTEMPTS)
-                await fetch_new_token(login, password)
-                success = True
-                break
-            except Exception as exc:
-                LOGGER.exception("Refresh attempt %s failed: %s", attempt, exc)
-                if attempt < MAX_REFRESH_ATTEMPTS:
-                    await asyncio.sleep(30)
-
-        if not success:
-            LOGGER.critical("All refresh attempts failed – stopping watchdog")
-            send_persistent_notification(
-                "❌ Nie udało się odświeżyć tokena eduVULCAN po 5 próbach.\n"
-                "Sprawdź dane logowania lub czy nie zmienił się mechanizm logowania."
-            )
-            return
+            # Nie pętlimy agresywnie
+            await asyncio.sleep(300)
+            continue
 
         # Krótka pauza po odświeżeniu
         await asyncio.sleep(30)
@@ -270,7 +277,7 @@ async def main() -> int:
             LOGGER.info("Running in one-shot mode (--once)")
             await fetch_new_token(login, password)
         else:
-            await watchdog_loop(login, password)
+            return await watchdog_loop(login, password)
         return 0
     except Exception as exc:
         LOGGER.exception("Unexpected error: %s", exc)
