@@ -12,7 +12,7 @@ RUN \
     python3 \
     python3-pip \
     ca-certificates \
-  && python3 -m pip install --no-cache-dir --break-system-packages playwright \
+  && python3 -m pip install --no-cache-dir --break-system-packages playwright aiohttp \
   && python3 -m playwright install --with-deps chromium \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
