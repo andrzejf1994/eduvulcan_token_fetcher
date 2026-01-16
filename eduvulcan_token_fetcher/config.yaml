@@ -18,6 +18,8 @@ map:
 options:
   login: ""
   password: ""
+  ha_token: ""
 schema:
   login: str
   password: password
+  ha_token: str
