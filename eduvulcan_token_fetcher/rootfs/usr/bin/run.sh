@@ -21,7 +21,6 @@ fi
 
 export EDUVULCAN_LOGIN="${login}"
 export EDUVULCAN_PASSWORD="${password}"
-export HA_TOKEN="${HA_TOKEN}"
 
 bashio::log.info "Starting EduVulcan token fetcher"
 
