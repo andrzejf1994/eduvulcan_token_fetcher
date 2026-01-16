@@ -7,6 +7,8 @@ import logging
 import argparse
 import time
 from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 from playwright.async_api import async_playwright
 
@@ -21,6 +23,9 @@ EDUVULCAN_URL = "https://eduvulcan.pl/api/ap"
 
 # Zapas przed wygaśnięciem JWT (sekundy)
 REFRESH_MARGIN = 300  # 5 minut
+
+# Maksymalna liczba prób odświeżenia w jednym cyklu
+MAX_REFRESH_ATTEMPTS = 5
 
 
 def decode_jwt_payload(jwt: str) -> dict:
@@ -53,6 +58,38 @@ def token_validity(token_data: dict):
         return seconds_left > REFRESH_MARGIN, exp, seconds_left
     except Exception:
         return False, 0, 0
+
+
+def send_persistent_notification(message: str, title: str = "EduVulcan Token Fetcher"):
+    """
+    Wysyła persistent notification do Home Assistant.
+    """
+    try:
+        payload = json.dumps(
+            {
+                "title": title,
+                "message": message,
+            }
+        ).encode("utf-8")
+
+        req = Request(
+            "http://supervisor/core/api/services/persistent_notification/create",
+            data=payload,
+            headers={
+                "Authorization": "Bearer " + os.getenv("SUPERVISOR_TOKEN", ""),
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        with urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                LOGGER.error("Failed to send notification, HTTP %s", resp.status)
+
+    except URLError as exc:
+        LOGGER.error("Failed to send persistent notification: %s", exc)
+    except Exception as exc:
+        LOGGER.error("Unexpected error while sending notification: %s", exc)
 
 
 async def fetch_new_token(login: str, password: str):
@@ -90,28 +127,28 @@ async def fetch_new_token(login: str, password: str):
                 LOGGER.info("Active session detected – token available without login")
             except:
                 LOGGER.info("No active session – performing login flow")
-            
+
                 # Upewnij się, że jesteśmy faktycznie na stronie logowania
                 try:
                     await page.wait_for_selector("#Alias", timeout=5000)
                 except:
                     LOGGER.warning("Login form not detected – clearing context and retrying fresh login")
-            
+
                     await context.close()
                     context = await browser.new_context()
                     page = await context.new_page()
                     await page.goto(EDUVULCAN_URL, wait_until="networkidle")
-            
+
                     await page.wait_for_selector("#Alias", timeout=30000)
-            
+
                 # Krok 1: login
                 await page.fill("#Alias", login)
                 await page.click("#btNext")
-            
+
                 # Krok 2: hasło
                 await page.wait_for_selector("#Password", timeout=30000)
                 await page.fill("#Password", password)
-            
+
                 # Captcha (jeśli się pojawi)
                 try:
                     await page.wait_for_selector("#captcha", state="visible", timeout=5000)
@@ -121,12 +158,12 @@ async def fetch_new_token(login: str, password: str):
                     )
                 except:
                     pass
-            
+
                 await page.click("#btLogOn")
-            
+
                 # Czekamy aż backend zwróci stronę z #ap
                 await page.wait_for_selector("#ap", state="attached", timeout=60000)
-                
+
             # 3) Odczyt tokena z #ap (jedyna prawidłowa metoda)
             token_json = await page.eval_on_selector("#ap", "el => el.value")
             data = json.loads(token_json)
@@ -170,6 +207,7 @@ async def watchdog_loop(login: str, password: str):
     Tryb ciągły:
     - sprawdza exp JWT
     - odświeża tylko gdy trzeba
+    - limit 5 prób, potem persistent notification
     """
     LOGGER.info("Starting JWT watchdog loop (refresh margin: %ss)", REFRESH_MARGIN)
 
@@ -189,13 +227,27 @@ async def watchdog_loop(login: str, password: str):
                 continue
 
         LOGGER.info("Token missing or expired – refreshing now...")
-        try:
-            await fetch_new_token(login, password)
-        except Exception as exc:
-            LOGGER.exception("Refresh failed: %s", exc)
-            # Nie pętlimy agresywnie przy błędzie
-            await asyncio.sleep(300)
-            continue
+
+        success = False
+
+        for attempt in range(1, MAX_REFRESH_ATTEMPTS + 1):
+            try:
+                LOGGER.info("Refresh attempt %s/%s", attempt, MAX_REFRESH_ATTEMPTS)
+                await fetch_new_token(login, password)
+                success = True
+                break
+            except Exception as exc:
+                LOGGER.exception("Refresh attempt %s failed: %s", attempt, exc)
+                if attempt < MAX_REFRESH_ATTEMPTS:
+                    await asyncio.sleep(30)
+
+        if not success:
+            LOGGER.critical("All refresh attempts failed – stopping watchdog")
+            send_persistent_notification(
+                "❌ Nie udało się odświeżyć tokena eduVULCAN po 5 próbach.\n"
+                "Sprawdź dane logowania lub czy nie zmienił się mechanizm logowania."
+            )
+            return
 
         # Krótka pauza po odświeżeniu
         await asyncio.sleep(30)
