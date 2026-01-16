@@ -1,40 +1,264 @@
-# Example Home Assistant add-on repository
+# EduVulcan Token Fetcher – Home Assistant Add-on
 
-This repository can be used as a "blueprint" for add-on development to help you get started.
+Dodatek do Home Assistant, który **automatycznie loguje się do eduVULCAN**, pobiera **JWT token dostępu** z oficjalnego endpointu oraz **samodzielnie go odnawia przed wygaśnięciem**. Token jest zapisywany w katalogu `config` Home Assistanta, dzięki czemu może być używany przez inne integracje, skrypty lub automatyzacje.
 
-Add-on documentation: <https://developers.home-assistant.io/docs/add-ons>
+Repozytorium zawiera gotowy add-on działający w środowisku Home Assistant Supervisor.
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fhome-assistant%2Faddons-example)
+---
 
-## Add-ons
+## 🚀 Instalacja (jednym kliknięciem)
 
-This repository contains the following add-ons
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fandrzejf1994%2Feduvulcan_token_fetcher)
 
-### [Example add-on](./example)
+Po dodaniu repozytorium:
+
+1. Przejdź do **Ustawienia → Dodatki → Sklep dodatków**.
+2. Znajdź **EduVulcan Token Fetcher**.
+3. Zainstaluj i skonfiguruj login oraz hasło.
+
+---
+
+## 🧠 Co robi ten dodatek?
+
+Dodatek:
+
+* Loguje się do **eduVULCAN** przy użyciu prawdziwego formularza logowania (Playwright / Chromium).
+* Otwiera bezpośredni endpoint:
+
+  ```
+  https://eduvulcan.pl/api/ap
+  ```
+* Odczytuje **JWT token** osadzony w polu `#ap` zwracanym przez backend.
+* Dekoduje payload JWT i wyciąga:
+
+  * `tenant`
+  * `exp` (czas wygaśnięcia)
+* Zapisuje token do:
+
+  ```
+  /config/eduvulcan_token.json
+  ```
+* Zapisuje sesję przeglądarki (cookies, localStorage) do:
+
+  ```
+  /data/eduvulcan_storage.json
+  ```
+* Uruchamia **watchdog**, który:
+
+  * monitoruje czas wygaśnięcia JWT (`exp`),
+  * automatycznie odświeża token przed jego wygaśnięciem,
+  * w razie błędu kończy działanie zamiast wysyłać zapytania z nieaktywnym tokenem.
+
+---
+
+## 🔐 Dlaczego `/api/ap`?
+
+Strona:
+
+```
+https://eduvulcan.pl/api/ap
+```
+
+jest miejscem, gdzie backend eduVULCAN **udostępnia aktualny token JWT w postaci JSON** w elemencie HTML:
+
+```html
+<input id="ap" value='{ "Tokens": ["<JWT>"], ... }' />
+```
+
+Dzięki temu:
+
+* token nie jest „wydobywany” z ruchu sieciowego,
+* nie ma potrzeby reverse-engineering API,
+* korzystamy z **oficjalnego mechanizmu sesji eduVULCAN**.
+
+---
+
+## ⚙️ Mechanizm działania – krok po kroku
+
+### 1️⃣ Start dodatku
+
+Po uruchomieniu Supervisor startuje kontener add-on.
+
+Dodatek:
+
+* odczytuje `EDUVULCAN_LOGIN` i `EDUVULCAN_PASSWORD` z konfiguracji,
+* sprawdza, czy istnieje zapisany stan sesji (`/data/eduvulcan_storage.json`).
+
+---
+
+### 2️⃣ Wejście na endpoint tokena
+
+Przeglądarka (Playwright + Chromium) otwiera:
+
+```
+https://eduvulcan.pl/api/ap
+```
+
+* Jeśli sesja jest nadal aktywna → token jest dostępny od razu.
+* Jeśli nie → backend przekierowuje do:
+
+  ```
+  /logowanie?ReturnUrl=%2Fapi%2Fap
+  ```
+
+---
+
+### 3️⃣ Logowanie
+
+Automatyzowany formularz:
+
+1. Wpisanie loginu (`#Alias`)
+2. Kliknięcie „Dalej”
+3. Wpisanie hasła (`#Password`)
+4. Obsługa CAPTCHA (jeśli wystąpi)
+5. Zatwierdzenie logowania
+
+Po poprawnym logowaniu backend wraca do `/api/ap`.
+
+---
+
+### 4️⃣ Pobranie tokena
+
+Dodatek odczytuje zawartość pola:
+
+```js
+document.querySelector("#ap").value
+```
+
+Z JSON wyciągane jest:
+
+* `Tokens[0]` → JWT
+* Dekodowany jest payload (`base64url`) w celu odczytania:
+
+  * `tenant`
+  * `exp` (czas wygaśnięcia)
+
+---
+
+### 5️⃣ Zapis danych
+
+#### Token:
+
+```
+/config/eduvulcan_token.json
+```
+
+Przykład:
+
+```json
+{
+  "tenant": "ABCD",
+  "jwt": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "jwt_payload": {
+    "tenant": "ABCD",
+    "exp": 1768575022,
+    "iat": 1768571422
+  },
+  "fetched_at": "2026-01-16T10:19:03+00:00",
+  "source": "eduvulcan.pl/api/ap"
+}
+```
+
+#### Sesja przeglądarki:
+
+```
+/data/eduvulcan_storage.json
+```
+
+Zawiera cookies i localStorage, dzięki czemu kolejne odświeżenia zwykle nie wymagają ponownego logowania.
+
+---
+
+### 6️⃣ Watchdog JWT (automatyczne odnawianie)
+
+Dodatek uruchamia pętlę:
+
+1. Odczytuje `exp` z JWT.
+2. Oblicza pozostały czas ważności.
+3. Gdy do wygaśnięcia zostanie mniej niż ustalony próg:
+
+   * ponownie wykonuje proces logowania,
+   * zapisuje nowy token,
+   * aktualizuje sesję.
+
+Jeśli wystąpi błąd (np. zmiana strony logowania, błąd CAPTCHA, brak tokena):
+
+* dodatek kończy działanie,
+* nie wysyła kolejnych zapytań na nieaktywnym tokenie.
+
+---
+
+## 🧩 Architektura techniczna
+
+* **Base image:** Debian (oficjalna baza Home Assistant)
+* **Browser:** Playwright + Chromium (headless)
+* **Persistencja:**
+
+  * `/config` → token dla Home Assistant
+  * `/data` → cookies / localStorage sesji
+* **Brak zależności zewnętrznych API** – wszystko odbywa się przez oficjalną stronę eduVULCAN.
+
+---
+
+## 🔄 Co NIE jest robione
+
+* Dodatek **nie publikuje danych bezpośrednio jako sensory HA**.
+* **Nie udostępnia jeszcze usług HA (`service`)** – token jest zapisywany do pliku.
+* Nie wykonuje żadnych zapytań do prywatnych endpointów API poza tym, co zwraca `/api/ap`.
+
+To celowe: dodatek pełni rolę **bezpiecznego token-provider’a**, który może być użyty przez:
+
+* własne integracje,
+* skrypty,
+* Node-RED,
+* REST sensors,
+* inne dodatki.
+
+---
+
+## 🧪 Weryfikacja działania
+
+W logach dodatku powinieneś zobaczyć m.in.:
+
+```
+Opening: https://eduvulcan.pl/api/ap
+Active session detected – token available without login
+Token saved to: /config/eduvulcan_token.json
+Starting JWT watchdog loop
+Token still valid. Expires at 2026-01-16T10:30:22+00:00 (in 2306s)
+```
+
+---
+
+## 📦 Zawartość repozytorium
+
+To repozytorium zawiera:
+
+### EduVulcan Token Fetcher
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
 
-_Example add-on to use as a blueprint for new add-ons._
+Dodatek do automatycznego pobierania i odnawiania JWT tokena z eduVULCAN.
 
-<!--
+---
 
-Notes to developers after forking or using the github template feature:
-- While developing comment out the 'image' key from 'example/config.yaml' to make the supervisor build the addon
-  - Remember to put this back when pushing up your changes.
-- When you merge to the 'main' branch of your repository a new build will be triggered.
-  - Make sure you adjust the 'version' key in 'example/config.yaml' when you do that.
-  - Make sure you update 'example/CHANGELOG.md' when you do that.
-  - The first time this runs you might need to adjust the image configuration on github container registry to make it public
-  - You may also need to adjust the github Actions configuration (Settings > Actions > General > Workflow > Read & Write)
-- Adjust the 'image' key in 'example/config.yaml' so it points to your username instead of 'home-assistant'.
-  - This is where the build images will be published to.
-- Rename the example directory.
-  - The 'slug' key in 'example/config.yaml' should match the directory name.
-- Adjust all keys/url's that points to 'home-assistant' to now point to your user/fork.
-- Share your repository on the forums https://community.home-assistant.io/c/projects/9
-- Do awesome stuff!
- -->
+## ⚠️ Uwagi prawne
+
+* Dodatek korzysta z **oficjalnej strony eduVULCAN i mechanizmu logowania użytkownika**.
+* Nie omija zabezpieczeń ani nie modyfikuje ruchu sieciowego.
+* Odpowiedzialność za zgodność z regulaminem serwisu eduVULCAN leży po stronie użytkownika.
+
+---
+
+## 🛣️ Plany rozwoju
+
+* [ ] Udostępnienie usługi Home Assistant: `eduvulcan.refresh_token`
+* [ ] Sensor stanu tokena (ważny / wygasł / błąd)
+* [ ] Webhook lub powiadomienia przy błędach logowania
+* [ ] Konfigurowalny próg odświeżania (`refresh_before_exp`)
+
+---
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
