@@ -1,8 +1,12 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration#add-on-config
 name: EduVulcan Token Fetcher
-version: "0.2"
+version: "0.4"
 slug: eduvulcan_token_fetcher
-description: Fetches JWT from eduVULCAN via Playwright (reads from #ap) and stores it in /config
+description: >
+  Automatycznie loguje się do eduVULCAN przez Playwright, pobiera JWT z /api/ap
+  i zapisuje go w /config/eduvulcan_token.json. Monitoruje ważność tokena
+  i odświeża go przed wygaśnięciem. Po 5 nieudanych próbach wysyła
+  persistent notification w Home Assistant.
 url: "https://developers.home-assistant.io/docs/add-ons"
 arch:
   - aarch64
@@ -18,6 +22,8 @@ map:
 options:
   login: ""
   password: ""
+  ha_token: ""
 schema:
   login: str
   password: password
+  ha_token: str
