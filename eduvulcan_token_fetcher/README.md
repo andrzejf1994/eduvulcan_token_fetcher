@@ -170,6 +170,24 @@ Jeśli wystąpi błąd (np. zmiana strony logowania, błąd CAPTCHA, brak tokena
 
 ---
 
+## 🔁 Ręczne odświeżenie tokena z Home Assistant (serwis)
+
+Dodatek obsługuje wywołanie przez usługę `hassio.addon_stdin`, bez restartu kontenera.
+Przykładowa automatyzacja/szablon w YAML:
+
+```yaml
+action:
+  - service: hassio.addon_stdin
+    data:
+      addon: eduvulcan_token_fetcher
+      input:
+        command: refresh_token
+```
+
+Wartość `command: refresh_token` uruchamia natychmiastowe odświeżenie tokena.
+
+---
+
 ## 🧪 Weryfikacja działania
 
 W logach dodatku powinieneś zobaczyć m.in.:
