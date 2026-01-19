@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 import urllib.request
+import urllib.error
 
 from playwright.async_api import async_playwright
 
@@ -115,6 +116,12 @@ def send_persistent_notification(title: str, message: str) -> None:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:  # Wywołanie REST do Supervisor API
             LOGGER.info("Persistent notification sent via Supervisor API (status %s)", resp.status)
+    except urllib.error.HTTPError as exc:
+        LOGGER.error(
+            "Failed to send persistent notification (status %s): %s",
+            exc.code,
+            exc.reason,
+        )
     except Exception as exc:
         LOGGER.error("Failed to send persistent notification: %s", exc)
 
@@ -336,6 +343,11 @@ async def main() -> int:
     if not login or not password:
         LOGGER.error("Missing login/password in environment variables")
         return 1
+
+    if os.getenv("SUPERVISOR_TOKEN"):
+        LOGGER.info("SUPERVISOR_TOKEN detected in environment")
+    else:
+        LOGGER.warning("SUPERVISOR_TOKEN missing in environment; notifications may fail")
 
     try:
         if args.once:
