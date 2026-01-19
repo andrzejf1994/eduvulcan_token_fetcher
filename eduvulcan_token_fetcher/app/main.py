@@ -7,6 +7,7 @@ import logging
 import argparse
 import time
 import sys
+import stat
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
@@ -355,7 +356,20 @@ async def stdin_listener(refresh_queue: asyncio.Queue) -> None:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    try:
+        fd = sys.stdin.fileno()
+        mode = os.fstat(fd).st_mode
+    except (OSError, ValueError) as exc:
+        LOGGER.warning("STDIN listener disabled (stdin unavailable): %s", exc)
+        return
+    if stat.S_ISREG(mode):
+        LOGGER.warning("STDIN listener disabled (stdin is not a pipe)")
+        return
+    try:
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    except (PermissionError, OSError) as exc:
+        LOGGER.warning("STDIN listener disabled: %s", exc)
+        return
 
     while True:
         line = await reader.readline()
