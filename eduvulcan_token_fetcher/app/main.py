@@ -30,7 +30,7 @@ ERROR_NOTIFICATION_ID = "eduvulcan_token_fetcher_error"
 
 # Zapas przed wygaśnięciem JWT (sekundy)
 # Dzięki temu odświeżenie następuje przed wygaśnięciem tokena i minimalizuje przerwy
-REFRESH_MARGIN = 15 #300  # 5 minut
+REFRESH_MARGIN = 300  # 5 minut
 
 # Limit nieudanych prób odświeżenia
 # Po przekroczeniu wysyłamy powiadomienie i kończymy pętlę watchdog
@@ -38,7 +38,7 @@ MAX_FAILURES = 5
 
 # Interwał przy błędzie (sekundy)
 # Wydłuża przerwę po błędzie, aby nie obciążać serwisu powtarzalnymi próbami
-FAIL_SLEEP = 15 #300  # 5 minut
+FAIL_SLEEP = 300  # 5 minut
 
 
 # Dekoduje payload JWT bez weryfikacji podpisu
