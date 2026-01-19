@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration#add-on-config
 name: EduVulcan Token Fetcher
-version: "0.4.6"
+version: "0.4.7"
 slug: eduvulcan_token_fetcher
 description: >
   Automatycznie loguje się do eduVULCAN przez Playwright, pobiera JWT z /api/ap
