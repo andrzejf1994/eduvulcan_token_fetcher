@@ -16,6 +16,7 @@ arch:
   - armhf
 init: false
 startup: services
+homeassistant_api: true
 
 map:
   - config:rw
