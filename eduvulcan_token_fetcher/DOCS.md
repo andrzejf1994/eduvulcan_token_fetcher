@@ -191,7 +191,7 @@ Jeśli wystąpi błąd (np. zmiana strony logowania, błąd CAPTCHA, brak tokena
 ## 🔄 Co NIE jest robione
 
 * Dodatek **nie publikuje danych bezpośrednio jako sensory HA**.
-* **Nie udostępnia jeszcze usług HA (`service`)** – token jest zapisywany do pliku.
+* **Nie publikuje danych jako encje w HA** – token jest zapisywany do pliku.
 * Nie wykonuje żadnych zapytań do prywatnych endpointów API poza tym, co zwraca `/api/ap`.
 
 To celowe: dodatek pełni rolę **bezpiecznego token-provider’a**, który może być użyty przez:
@@ -201,6 +201,24 @@ To celowe: dodatek pełni rolę **bezpiecznego token-provider’a**, który moż
 * Node-RED,
 * REST sensors,
 * inne dodatki.
+
+---
+
+## 🔁 Ręczne odświeżenie tokena z Home Assistant (serwis)
+
+Dodatek obsługuje wywołanie przez usługę `hassio.addon_stdin`, bez restartu kontenera.
+Przykładowa automatyzacja/szablon w YAML:
+
+```yaml
+action:
+  - service: hassio.addon_stdin
+    data:
+      addon: eduvulcan_token_fetcher
+      input:
+        command: refresh_token
+```
+
+Wartość `command: refresh_token` uruchamia natychmiastowe odświeżenie tokena.
 
 ---
 
@@ -241,7 +259,7 @@ Dodatek do automatycznego pobierania i odnawiania JWT tokena z eduVULCAN.
 
 ## 🛣️ Plany rozwoju
 
-* [ ] Udostępnienie usługi Home Assistant: `eduvulcan.refresh_token`
+* [x] Ręczne odświeżenie tokena z Home Assistant
 * [ ] Sensor stanu tokena (ważny / wygasł / błąd)
 * [ ] Webhook lub powiadomienia przy błędach logowania
 * [ ] Konfigurowalny próg odświeżania (`refresh_before_exp`)

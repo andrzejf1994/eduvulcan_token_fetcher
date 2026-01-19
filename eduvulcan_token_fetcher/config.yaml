@@ -17,6 +17,7 @@ arch:
 init: false
 startup: services
 homeassistant_api: true
+stdin: true
 
 map:
   - config:rw

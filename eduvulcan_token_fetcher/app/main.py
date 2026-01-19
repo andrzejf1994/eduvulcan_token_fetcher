@@ -6,6 +6,8 @@ import base64
 import logging
 import argparse
 import time
+import sys
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
 import urllib.request
@@ -312,11 +314,88 @@ async def remove_privacy_overlay(page):
         });
     """)
 
+def _drain_refresh_queue(refresh_queue: Optional[asyncio.Queue]) -> None:
+    if not refresh_queue:
+        return
+
+    drained = 0
+    while True:
+        try:
+            refresh_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            refresh_queue.task_done()
+            drained += 1
+
+    if drained:
+        LOGGER.info("Drained %s pending manual refresh request(s)", drained)
+
+async def _wait_for_refresh_request(
+    refresh_queue: Optional[asyncio.Queue],
+    timeout: Optional[float],
+) -> Optional[dict]:
+    if not refresh_queue:
+        return None
+
+    try:
+        request = await asyncio.wait_for(refresh_queue.get(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+
+    refresh_queue.task_done()
+    return request
+
+async def stdin_listener(refresh_queue: asyncio.Queue) -> None:
+    """
+    Nasłuchuje wejścia STDIN (np. hassio.addon_stdin) i obsługuje polecenia.
+    Obsługiwane polecenie: refresh_token.
+    """
+    LOGGER.info("STDIN listener started")
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+    while True:
+        line = await reader.readline()
+        if not line:
+            await asyncio.sleep(0.1)
+            continue
+
+        raw_input = line.decode("utf-8", errors="replace").strip()
+        if not raw_input:
+            continue
+
+        try:
+            payload = json.loads(raw_input)
+        except json.JSONDecodeError:
+            payload = raw_input
+
+        command = None
+        if isinstance(payload, dict):
+            command = payload.get("command") or payload.get("service") or payload.get("action")
+            if not command and payload.get("refresh_token"):
+                command = "refresh_token"
+        elif isinstance(payload, str):
+            command = payload
+
+        if command == "refresh_token":
+            LOGGER.info("Manual refresh request received via STDIN")
+            await refresh_queue.put({"source": "stdin"})
+            continue
+
+        LOGGER.warning("Unsupported STDIN command: %s", payload)
+
 # Uruchamia pętlę odświeżania tokena na podstawie czasu wygaśnięcia
 # Wejście: login i password (str)
 # Wyjście: None (działa w pętli aż do błędu krytycznego)
 # Założenia/skutki: w razie wielokrotnych błędów wysyła persistent notification
-async def watchdog_loop(login: str, password: str):
+async def watchdog_loop(
+    login: str,
+    password: str,
+    refresh_queue: Optional[asyncio.Queue] = None,
+):
     """
     Tryb ciągły:
     - sprawdza exp JWT
@@ -329,9 +408,16 @@ async def watchdog_loop(login: str, password: str):
 
     # Pętla nieskończona, która usypia między kolejnymi kontrolami ważności
     while True:
+        manual_request = await _wait_for_refresh_request(refresh_queue, 0)
+        if manual_request:
+            LOGGER.info("Manual refresh requested (%s)", manual_request.get("source", "unknown"))
+            _drain_refresh_queue(refresh_queue)
+        else:
+            manual_request = None
+
         token_data = read_saved_token()
 
-        if token_data:
+        if token_data and not manual_request:
             valid, exp, seconds_left = token_validity(token_data)
             if valid:
                 sleep_for = max(60, seconds_left - REFRESH_MARGIN)  # Minimalnie 60s między kontrolami
@@ -340,10 +426,17 @@ async def watchdog_loop(login: str, password: str):
                     "Token still valid. Expires at %s (in %ss). Next check in %ss",
                     exp_dt, seconds_left, sleep_for
                 )
-                await asyncio.sleep(sleep_for)
-                continue
+                manual_request = await _wait_for_refresh_request(refresh_queue, sleep_for)
+                if not manual_request:
+                    continue
 
-        LOGGER.info("Token missing or expired – refreshing now...")
+                LOGGER.info("Manual refresh requested (%s)", manual_request.get("source", "unknown"))
+                _drain_refresh_queue(refresh_queue)
+
+        if manual_request:
+            LOGGER.info("Manual refresh requested – refreshing now...")
+        else:
+            LOGGER.info("Token missing or expired – refreshing now...")
         try:
             await fetch_new_token(login, password)
             failures = 0  # reset po sukcesie
@@ -404,7 +497,14 @@ async def main() -> int:
             LOGGER.info("Running in one-shot mode (--once)")
             await fetch_new_token(login, password)
         else:
-            await watchdog_loop(login, password)
+            refresh_queue: asyncio.Queue = asyncio.Queue()
+            stdin_task = asyncio.create_task(stdin_listener(refresh_queue))
+            try:
+                await watchdog_loop(login, password, refresh_queue)
+            finally:
+                stdin_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stdin_task
         return 0
     except Exception as exc:
         LOGGER.exception("Unexpected error: %s", exc)
