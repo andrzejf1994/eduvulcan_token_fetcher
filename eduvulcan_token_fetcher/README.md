@@ -53,12 +53,6 @@ jest miejscem, gdzie backend eduVULCAN **udostępnia aktualny token JWT w postac
 <input id="ap" value='{ "Tokens": ["<JWT>"], ... }' />
 ```
 
-Dzięki temu:
-
-* token nie jest „wydobywany” z ruchu sieciowego,
-* nie ma potrzeby reverse-engineering API,
-* korzystamy z **oficjalnego mechanizmu sesji eduVULCAN**.
-
 ---
 
 ## ⚙️ Mechanizm działania – krok po kroku
@@ -176,34 +170,6 @@ Jeśli wystąpi błąd (np. zmiana strony logowania, błąd CAPTCHA, brak tokena
 
 ---
 
-## 🧩 Architektura techniczna
-
-* **Base image:** Debian (oficjalna baza Home Assistant)
-* **Browser:** Playwright + Chromium (headless)
-* **Persistencja:**
-
-  * `/config` → token dla Home Assistant
-  * `/data` → cookies / localStorage sesji
-* **Brak zależności zewnętrznych API** – wszystko odbywa się przez oficjalną stronę eduVULCAN.
-
----
-
-## 🔄 Co NIE jest robione
-
-* Dodatek **nie publikuje danych bezpośrednio jako sensory HA**.
-* **Nie udostępnia jeszcze usług HA (`service`)** – token jest zapisywany do pliku.
-* Nie wykonuje żadnych zapytań do prywatnych endpointów API poza tym, co zwraca `/api/ap`.
-
-To celowe: dodatek pełni rolę **bezpiecznego token-provider’a**, który może być użyty przez:
-
-* własne integracje,
-* skrypty,
-* Node-RED,
-* REST sensors,
-* inne dodatki.
-
----
-
 ## 🧪 Weryfikacja działania
 
 W logach dodatku powinieneś zobaczyć m.in.:
@@ -236,15 +202,6 @@ Dodatek do automatycznego pobierania i odnawiania JWT tokena z eduVULCAN.
 * Dodatek korzysta z **oficjalnej strony eduVULCAN i mechanizmu logowania użytkownika**.
 * Nie omija zabezpieczeń ani nie modyfikuje ruchu sieciowego.
 * Odpowiedzialność za zgodność z regulaminem serwisu eduVULCAN leży po stronie użytkownika.
-
----
-
-## 🛣️ Plany rozwoju
-
-* [ ] Udostępnienie usługi Home Assistant: `eduvulcan.refresh_token`
-* [ ] Sensor stanu tokena (ważny / wygasł / błąd)
-* [ ] Webhook lub powiadomienia przy błędach logowania
-* [ ] Konfigurowalny próg odświeżania (`refresh_before_exp`)
 
 ---
 
