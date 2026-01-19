@@ -344,10 +344,16 @@ async def main() -> int:
         LOGGER.error("Missing login/password in environment variables")
         return 1
 
-    if os.getenv("SUPERVISOR_TOKEN"):
-        LOGGER.info("SUPERVISOR_TOKEN detected in environment")
+    supervisor_token = os.getenv("SUPERVISOR_TOKEN")
+    if supervisor_token:
+        LOGGER.info("SUPERVISOR_TOKEN detected in environment: %s", supervisor_token)
     else:
         LOGGER.warning("SUPERVISOR_TOKEN missing in environment; notifications may fail")
+
+    send_persistent_notification(
+        title="EduVulcan Token Fetcher – uruchomienie",
+        message="Add-on został uruchomiony i rozpoczyna pracę.",
+    )
 
     try:
         if args.once:
