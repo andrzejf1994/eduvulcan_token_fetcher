@@ -25,6 +25,9 @@ STORAGE_FILE = "/data/eduvulcan_storage.json"
 # Ten endpoint zwraca lub przekierowuje do logowania i umożliwia pobranie tokena
 EDUVULCAN_URL = "https://eduvulcan.pl/api/ap"
 
+# Id powiadomienia HA dla błędów pobierania tokena
+ERROR_NOTIFICATION_ID = "eduvulcan_token_fetcher_error"
+
 # Zapas przed wygaśnięciem JWT (sekundy)
 # Dzięki temu odświeżenie następuje przed wygaśnięciem tokena i minimalizuje przerwy
 REFRESH_MARGIN = 15 #300  # 5 minut
@@ -86,7 +89,7 @@ def token_validity(token_data: dict):
 # Wejście: tytuł i treść wiadomości
 # Wyjście: None (loguje status)
 # Założenia/skutki: wymaga SUPERVISOR_TOKEN w środowisku
-def send_persistent_notification(title: str, message: str) -> None:
+def send_persistent_notification(title: str, message: str, notification_id: Optional[str] = None) -> None:
     """
     Wysyła persistent notification do Home Assistant przez Supervisor API.
     Nie wymaga tokena użytkownika ani aiohttp.
@@ -101,6 +104,8 @@ def send_persistent_notification(title: str, message: str) -> None:
         "title": title,
         "message": message,
     }
+    if notification_id:
+        payload["notification_id"] = notification_id
 
     data = json.dumps(payload).encode("utf-8")  # Serializuj payload do JSON
     req = urllib.request.Request(
@@ -125,6 +130,42 @@ def send_persistent_notification(title: str, message: str) -> None:
     except Exception as exc:
         LOGGER.error("Failed to send persistent notification: %s", exc)
 
+def dismiss_persistent_notification(notification_id: str) -> None:
+    """
+    Usuwa persistent notification z Home Assistant przez Supervisor API.
+    """
+    supervisor_token = os.getenv("SUPERVISOR_TOKEN")
+    if not supervisor_token:
+        LOGGER.error("SUPERVISOR_TOKEN not found in environment; cannot dismiss notification")
+        return
+
+    url = "http://supervisor/core/api/services/persistent_notification/dismiss"
+    payload = {
+        "notification_id": notification_id,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {supervisor_token}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            LOGGER.info("Persistent notification dismissed via Supervisor API (status %s)", resp.status)
+    except urllib.error.HTTPError as exc:
+        LOGGER.error(
+            "Failed to dismiss persistent notification (status %s): %s",
+            exc.code,
+            exc.reason,
+        )
+    except Exception as exc:
+        LOGGER.error("Failed to dismiss persistent notification: %s", exc)
 
 # Pobiera nowy token JWT przez automatyzację logowania w Playwright
 # Wejście: login i password (str)
@@ -215,6 +256,11 @@ async def fetch_new_token(login: str, password: str):
             tokens = data.get("Tokens") or []  # Tokens[] może być puste lub nieobecne
             jwt = tokens[0] if tokens else None  # W praktyce pierwszy element to JWT
             if not jwt:
+                send_persistent_notification(
+                    title="EduVulcan Token Fetcher – błąd",
+                    message="Nie wykryto tokena JWT w odpowiedzi eduVULCAN.",
+                    notification_id=ERROR_NOTIFICATION_ID,
+                )
                 raise RuntimeError("Brak JWT w polu Tokens[]")
 
             payload = decode_jwt_payload(jwt)
@@ -316,6 +362,7 @@ async def watchdog_loop(login: str, password: str):
                 send_persistent_notification(
                     title="EduVulcan Token Fetcher – błąd",
                     message=msg,
+                    notification_id=ERROR_NOTIFICATION_ID,
                 )
                 LOGGER.error("Max failures reached. Stopping watchdog loop.")
                 return
@@ -346,14 +393,11 @@ async def main() -> int:
 
     supervisor_token = os.getenv("SUPERVISOR_TOKEN")
     if supervisor_token:
-        LOGGER.info("SUPERVISOR_TOKEN detected in environment: %s", supervisor_token)
+        LOGGER.info("SUPERVISOR_TOKEN detected in environment")
     else:
         LOGGER.warning("SUPERVISOR_TOKEN missing in environment; notifications may fail")
 
-    send_persistent_notification(
-        title="EduVulcan Token Fetcher – uruchomienie",
-        message="Add-on został uruchomiony i rozpoczyna pracę.",
-    )
+    dismiss_persistent_notification(ERROR_NOTIFICATION_ID)
 
     try:
         if args.once:
