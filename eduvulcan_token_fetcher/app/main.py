@@ -362,7 +362,7 @@ async def stdin_listener(refresh_queue: asyncio.Queue) -> None:
     except (OSError, ValueError) as exc:
         LOGGER.warning("STDIN listener disabled (stdin unavailable): %s", exc)
         return
-    if stat.S_ISREG(mode):
+    if not stat.S_ISFIFO(mode):
         LOGGER.warning("STDIN listener disabled (stdin is not a pipe)")
         return
     try:
