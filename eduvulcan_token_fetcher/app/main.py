@@ -15,29 +15,43 @@ from playwright.async_api import async_playwright
 LOGGER = logging.getLogger("eduvulcan_token_fetcher")
 
 # Ścieżki w HA
+# Zawiera docelową lokalizację zapisu/odczytu tokena w środowisku Home Assistant
 TOKEN_FILE = "/config/eduvulcan_token.json"
+# Zawiera lokalizację zapisu stanu przeglądarki (cookies, localStorage) dla ponownych logowań
 STORAGE_FILE = "/data/eduvulcan_storage.json"
 
 # Startujemy ZAWSZE od /api/ap
+# Ten endpoint zwraca lub przekierowuje do logowania i umożliwia pobranie tokena
 EDUVULCAN_URL = "https://eduvulcan.pl/api/ap"
 
 # Zapas przed wygaśnięciem JWT (sekundy)
+# Dzięki temu odświeżenie następuje przed wygaśnięciem tokena i minimalizuje przerwy
 REFRESH_MARGIN = 300  # 5 minut
 
 # Limit nieudanych prób odświeżenia
+# Po przekroczeniu wysyłamy powiadomienie i kończymy pętlę watchdog
 MAX_FAILURES = 5
 
 # Interwał przy błędzie (sekundy)
+# Wydłuża przerwę po błędzie, aby nie obciążać serwisu powtarzalnymi próbami
 FAIL_SLEEP = 300  # 5 minut
 
 
+# Dekoduje payload JWT bez weryfikacji podpisu
+# Wejście: jwt (str) w formacie header.payload.signature
+# Wyjście: słownik z danymi payload
+# Założenia/skutki: brak walidacji podpisu, używane tylko do odczytu exp/tenant
 def decode_jwt_payload(jwt: str) -> dict:
-    payload = jwt.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    decoded = base64.urlsafe_b64decode(payload)
+    payload = jwt.split(".")[1]  # Wydziel część payload z JWT
+    payload += "=" * (-len(payload) % 4)  # Uzupełnij padding Base64 URL-safe
+    decoded = base64.urlsafe_b64decode(payload)  # Dekoduj JSON payload
     return json.loads(decoded)
 
 
+# Wczytuje zapisany token z pliku konfiguracyjnego
+# Wejście: brak (ścieżka stała TOKEN_FILE)
+# Wyjście: dict z tokenem lub None gdy brak/odczyt nieudany
+# Założenia/skutki: loguje ostrzeżenie przy błędzie IO/JSON
 def read_saved_token() -> Optional[dict]:
     if not os.path.exists(TOKEN_FILE):
         return None
@@ -49,6 +63,10 @@ def read_saved_token() -> Optional[dict]:
         return None
 
 
+# Sprawdza ważność tokena na podstawie pola exp w payload
+# Wejście: token_data (dict) z kluczem jwt_payload
+# Wyjście: krotka (is_valid, exp_ts, seconds_left)
+# Założenia/skutki: przy błędnym formacie zwraca wartości zerowe
 def token_validity(token_data: dict):
     """
     Zwraca: (is_valid: bool, exp_ts: int, seconds_left: int)
@@ -57,12 +75,16 @@ def token_validity(token_data: dict):
         payload = token_data["jwt_payload"]
         exp = int(payload["exp"])
         now = int(time.time())
-        seconds_left = exp - now
+        seconds_left = exp - now  # Różnica czasu do wygaśnięcia w sekundach
         return seconds_left > REFRESH_MARGIN, exp, seconds_left
     except Exception:
         return False, 0, 0
 
 
+# Wysyła powiadomienie persistent_notification przez Supervisor API
+# Wejście: tytuł i treść wiadomości
+# Wyjście: None (loguje status)
+# Założenia/skutki: wymaga SUPERVISOR_TOKEN w środowisku
 def send_persistent_notification(title: str, message: str) -> None:
     """
     Wysyła persistent notification do Home Assistant przez Supervisor API.
@@ -79,7 +101,7 @@ def send_persistent_notification(title: str, message: str) -> None:
         "message": message,
     }
 
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(payload).encode("utf-8")  # Serializuj payload do JSON
     req = urllib.request.Request(
         url,
         data=data,
@@ -91,16 +113,21 @@ def send_persistent_notification(title: str, message: str) -> None:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # Wywołanie REST do Supervisor API
             LOGGER.info("Persistent notification sent via Supervisor API (status %s)", resp.status)
     except Exception as exc:
         LOGGER.error("Failed to send persistent notification: %s", exc)
 
 
+# Pobiera nowy token JWT przez automatyzację logowania w Playwright
+# Wejście: login i password (str)
+# Wyjście: None (zapisuje token i stan sesji na dysk)
+# Założenia/skutki: zapisuje pliki TOKEN_FILE i STORAGE_FILE
 async def fetch_new_token(login: str, password: str):
     LOGGER.info("Launching Playwright (headless Chromium)")
 
     async with async_playwright() as p:
+        # Uruchom przeglądarkę w trybie headless z flagami kompatybilnymi z kontenerem
         browser = await p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"]
@@ -140,6 +167,7 @@ async def fetch_new_token(login: str, password: str):
                 except Exception:
                     LOGGER.warning("Login form not detected – clearing context and retrying fresh login")
 
+                    # Resetuj kontekst przeglądarki, aby usunąć potencjalnie uszkodzoną sesję
                     await context.close()
                     context = await browser.new_context()
                     page = await context.new_page()
@@ -177,8 +205,8 @@ async def fetch_new_token(login: str, password: str):
             token_json = await page.eval_on_selector("#ap", "el => el.value")
             data = json.loads(token_json)
 
-            tokens = data.get("Tokens") or []
-            jwt = tokens[0] if tokens else None
+            tokens = data.get("Tokens") or []  # Tokens[] może być puste lub nieobecne
+            jwt = tokens[0] if tokens else None  # W praktyce pierwszy element to JWT
             if not jwt:
                 raise RuntimeError("Brak JWT w polu Tokens[]")
 
@@ -210,6 +238,10 @@ async def fetch_new_token(login: str, password: str):
         finally:
             await browser.close()
 
+# Usuwa nakładki prywatności/cookies blokujące interakcję z formularzem
+# Wejście: page (Playwright Page)
+# Wyjście: None (modyfikuje DOM strony)
+# Założenia/skutki: modyfikuje elementy DOM, aby umożliwić kliknięcia
 async def remove_privacy_overlay(page):
     await page.evaluate("""
         // Usuń główny wrapper
@@ -227,6 +259,10 @@ async def remove_privacy_overlay(page):
         });
     """)
 
+# Uruchamia pętlę odświeżania tokena na podstawie czasu wygaśnięcia
+# Wejście: login i password (str)
+# Wyjście: None (działa w pętli aż do błędu krytycznego)
+# Założenia/skutki: w razie wielokrotnych błędów wysyła persistent notification
 async def watchdog_loop(login: str, password: str):
     """
     Tryb ciągły:
@@ -238,14 +274,15 @@ async def watchdog_loop(login: str, password: str):
 
     failures = 0
 
+    # Pętla nieskończona, która usypia między kolejnymi kontrolami ważności
     while True:
         token_data = read_saved_token()
 
         if token_data:
             valid, exp, seconds_left = token_validity(token_data)
             if valid:
-                sleep_for = max(60, seconds_left - REFRESH_MARGIN)
-                exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+                sleep_for = max(60, seconds_left - REFRESH_MARGIN)  # Minimalnie 60s między kontrolami
+                exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()  # Log czytelnego czasu wygaśnięcia
                 LOGGER.info(
                     "Token still valid. Expires at %s (in %ss). Next check in %ss",
                     exp_dt, seconds_left, sleep_for
@@ -261,6 +298,7 @@ async def watchdog_loop(login: str, password: str):
             failures += 1
             LOGGER.exception("Refresh failed (%s/%s): %s", failures, MAX_FAILURES, exc)
 
+            # Po przekroczeniu limitu kończymy pętlę i informujemy użytkownika
             if failures >= MAX_FAILURES:
                 msg = (
                     "Nie udało się odświeżyć tokena eduVULCAN po "
@@ -283,6 +321,10 @@ async def watchdog_loop(login: str, password: str):
         await asyncio.sleep(30)
 
 
+# Punkt wejścia aplikacji: parsuje argumenty i wybiera tryb pracy
+# Wejście: argumenty CLI (--once) oraz zmienne środowiskowe login/hasło
+# Wyjście: kod zakończenia procesu (int)
+# Założenia/skutki: loguje błędy i propaguje kod wyjścia do SystemExit
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Refresh token once and exit")
@@ -308,6 +350,7 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
+    # Inicjalizacja loggera i uruchomienie głównej pętli asynchronicznej
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
