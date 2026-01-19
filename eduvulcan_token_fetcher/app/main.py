@@ -26,7 +26,7 @@ EDUVULCAN_URL = "https://eduvulcan.pl/api/ap"
 
 # Zapas przed wygaśnięciem JWT (sekundy)
 # Dzięki temu odświeżenie następuje przed wygaśnięciem tokena i minimalizuje przerwy
-REFRESH_MARGIN = 300  # 5 minut
+REFRESH_MARGIN = 15 #300  # 5 minut
 
 # Limit nieudanych prób odświeżenia
 # Po przekroczeniu wysyłamy powiadomienie i kończymy pętlę watchdog
@@ -34,7 +34,7 @@ MAX_FAILURES = 5
 
 # Interwał przy błędzie (sekundy)
 # Wydłuża przerwę po błędzie, aby nie obciążać serwisu powtarzalnymi próbami
-FAIL_SLEEP = 300  # 5 minut
+FAIL_SLEEP = 15 #300  # 5 minut
 
 
 # Dekoduje payload JWT bez weryfikacji podpisu
@@ -199,7 +199,7 @@ async def fetch_new_token(login: str, password: str):
                 await page.click("#btLogOn")
 
                 # Czekamy aż backend zwróci stronę z #ap
-                await page.wait_for_selector("#ap", state="attached", timeout=60000)
+                await page.wait_for_selector("#ap", state="attached", timeout=30000) #30s
 
             # 3) Odczyt tokena z #ap (jedyna prawidłowa metoda)
             token_json = await page.eval_on_selector("#ap", "el => el.value")
