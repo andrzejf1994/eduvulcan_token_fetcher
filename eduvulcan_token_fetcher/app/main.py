@@ -6,12 +6,13 @@ import base64
 import logging
 import argparse
 import time
+import re
 from datetime import datetime, timezone
 from typing import Optional
 import urllib.request
 import urllib.error
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 LOGGER = logging.getLogger("eduvulcan_token_fetcher")
 
@@ -20,6 +21,7 @@ LOGGER = logging.getLogger("eduvulcan_token_fetcher")
 TOKEN_FILE = "/config/eduvulcan_token.json"
 # Zawiera lokalizację zapisu stanu przeglądarki (cookies, localStorage) dla ponownych logowań
 STORAGE_FILE = "/data/eduvulcan_storage.json"
+DEBUG_DIR = "/data"
 
 # Startujemy ZAWSZE od /api/ap
 # Ten endpoint zwraca lub przekierowuje do logowania i umożliwia pobranie tokena
@@ -39,6 +41,49 @@ MAX_FAILURES = 5
 # Interwał przy błędzie (sekundy)
 # Wydłuża przerwę po błędzie, aby nie obciążać serwisu powtarzalnymi próbami
 FAIL_SLEEP = 300  # 5 minut
+
+
+class LoginFlowError(RuntimeError):
+    """Raised when the current eduVULCAN login page cannot be automated safely."""
+
+
+LOGIN_FIELD_SELECTORS = [
+    ("legacy Alias field", "#Alias"),
+    ("Alias input", "input[name='Alias']"),
+    ("alias-like input", "input[id*='Alias' i]"),
+    ("username input", "input[name='username' i]"),
+    ("login input", "input[name='login' i]"),
+    ("email input", "input[type='email']"),
+    ("visible text input", "input[type='text']"),
+]
+
+PASSWORD_FIELD_SELECTORS = [
+    ("legacy Password field", "#Password"),
+    ("password input", "input[name='Password' i]"),
+    ("visible password input", "input[type='password']"),
+]
+
+NEXT_BUTTON_SELECTORS = [
+    ("legacy next button", "#btNext"),
+    ("next button", "button:has-text('Dalej')"),
+    ("continue button", "button:has-text('Kontynuuj')"),
+    ("submit button", "button[type='submit']"),
+    ("next link", "a:has-text('Dalej')"),
+]
+
+LOGIN_BUTTON_SELECTORS = [
+    ("legacy logon button", "#btLogOn"),
+    ("login button", "button:has-text('Zaloguj')"),
+    ("sign in button", "button:has-text('Logowanie')"),
+    ("submit button", "button[type='submit']"),
+]
+
+INTERMEDIATE_LOGIN_SELECTORS = [
+    ("login link", "a:has-text('Zaloguj')"),
+    ("login button", "button:has-text('Zaloguj')"),
+    ("login url link", "a[href*='logowanie' i]"),
+    ("login url link", "a[href*='login' i]"),
+]
 
 
 # Dekoduje payload JWT bez weryfikacji podpisu
@@ -167,21 +212,176 @@ def dismiss_persistent_notification(notification_id: str) -> None:
     except Exception as exc:
         LOGGER.error("Failed to dismiss persistent notification: %s", exc)
 
-# Pobiera nowy token JWT przez automatyzację logowania w Playwright
-# Wejście: login i password (str)
-# Wyjście: None (zapisuje token i stan sesji na dysk)
-# Założenia/skutki: zapisuje pliki TOKEN_FILE i STORAGE_FILE
+def _safe_debug_name(reason: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", reason.strip().lower())
+    return safe[:80] or "page"
+
+
+async def describe_page(page) -> str:
+    try:
+        title = await page.title()
+    except Exception:
+        title = "<title unavailable>"
+    return f"url={page.url!r}, title={title!r}"
+
+
+async def save_page_diagnostics(page, reason: str) -> None:
+    """
+    Saves HTML and screenshot for the current page so login failures include
+    the real page state, not only a selector timeout.
+    """
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_reason = _safe_debug_name(reason)
+    html_path = os.path.join(DEBUG_DIR, f"eduvulcan_debug_{stamp}_{safe_reason}.html")
+    screenshot_path = os.path.join(DEBUG_DIR, f"eduvulcan_debug_{stamp}_{safe_reason}.png")
+
+    LOGGER.error("Login diagnostics: %s", await describe_page(page))
+
+    try:
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        LOGGER.error("Saved diagnostic HTML: %s", html_path)
+    except Exception as exc:
+        LOGGER.warning("Failed to save diagnostic HTML: %s", exc)
+
+    try:
+        await page.screenshot(path=screenshot_path, full_page=True)
+        LOGGER.error("Saved diagnostic screenshot: %s", screenshot_path)
+    except Exception as exc:
+        LOGGER.warning("Failed to save diagnostic screenshot: %s", exc)
+
+
+async def find_visible_locator(page, selectors, timeout: int = 30000):
+    deadline = time.monotonic() + timeout / 1000
+    last_error = None
+
+    while time.monotonic() < deadline:
+        for name, selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+                await locator.wait_for(state="visible", timeout=500)
+                return name, selector, locator
+            except Exception as exc:
+                last_error = exc
+
+        await asyncio.sleep(0.25)
+
+    selector_summary = ", ".join(selector for _, selector in selectors)
+    raise PlaywrightTimeoutError(
+        f"Timeout waiting for any visible selector: {selector_summary}. "
+        f"Last error: {last_error}"
+    )
+
+
+async def click_first_visible(page, selectors, timeout: int = 10000):
+    name, selector, locator = await find_visible_locator(page, selectors, timeout=timeout)
+    LOGGER.info("Clicking %s (%s)", name, selector)
+    await remove_privacy_overlay(page)
+    await locator.click()
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    return name, selector
+
+
+async def ensure_login_field(page, timeout: int = 30000):
+    deadline = time.monotonic() + timeout / 1000
+
+    while time.monotonic() < deadline:
+        await remove_privacy_overlay(page)
+
+        try:
+            await page.wait_for_selector("#ap", timeout=1000)
+            LOGGER.info("Token field appeared while looking for login form")
+            return None
+        except Exception:
+            pass
+
+        try:
+            return await find_visible_locator(page, LOGIN_FIELD_SELECTORS, timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            await click_first_visible(page, INTERMEDIATE_LOGIN_SELECTORS, timeout=2000)
+            continue
+        except Exception:
+            await asyncio.sleep(0.5)
+
+    await save_page_diagnostics(page, "login_form_not_detected")
+    raise LoginFlowError(
+        "Nie wykryto formularza logowania eduVULCAN. "
+        f"Aktualna strona: {await describe_page(page)}"
+    )
+
+
+async def fill_login_form(page, login: str, password: str) -> None:
+    login_match = await ensure_login_field(page, timeout=30000)
+    if login_match is None:
+        return
+
+    login_name, login_selector, login_locator = login_match
+    LOGGER.info("Login field detected: %s (%s)", login_name, login_selector)
+    await login_locator.fill(login)
+
+    try:
+        password_name, password_selector, password_locator = await find_visible_locator(
+            page, PASSWORD_FIELD_SELECTORS, timeout=1500
+        )
+    except Exception:
+        try:
+            await click_first_visible(page, NEXT_BUTTON_SELECTORS, timeout=10000)
+        except Exception:
+            LOGGER.info("Next button not detected; submitting login field with Enter")
+            await login_locator.press("Enter")
+        password_name, password_selector, password_locator = await find_visible_locator(
+            page, PASSWORD_FIELD_SELECTORS, timeout=30000
+        )
+
+    LOGGER.info("Password field detected: %s (%s)", password_name, password_selector)
+    await password_locator.fill(password)
+
+    try:
+        await page.wait_for_selector("#captcha", state="visible", timeout=5000)
+        await save_page_diagnostics(page, "captcha_detected")
+        raise LoginFlowError(
+            "Wykryto captcha podczas logowania eduVULCAN. "
+            f"Aktualna strona: {await describe_page(page)}"
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    try:
+        await click_first_visible(page, LOGIN_BUTTON_SELECTORS, timeout=10000)
+    except Exception:
+        LOGGER.info("Login button not detected; submitting password field with Enter")
+        await password_locator.press("Enter")
+
+    try:
+        await page.wait_for_selector("#ap", state="attached", timeout=30000)
+    except Exception as exc:
+        await save_page_diagnostics(page, "token_field_not_detected_after_login")
+        raise LoginFlowError(
+            "Logowanie nie zakonczylo sie strona tokena (#ap). "
+            f"Aktualna strona: {await describe_page(page)}. "
+            f"Oryginalny blad: {exc}"
+        ) from exc
+
+
 async def fetch_new_token(login: str, password: str):
     LOGGER.info("Launching Playwright (headless Chromium)")
 
     async with async_playwright() as p:
-        # Uruchom przeglądarkę w trybie headless z flagami kompatybilnymi z kontenerem
         browser = await p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
 
-        # Wczytaj cookies / sesję jeśli istnieją
         if os.path.exists(STORAGE_FILE):
             LOGGER.info("Loading stored cookies/session")
             context = await browser.new_context(storage_state=STORAGE_FILE)
@@ -191,73 +391,41 @@ async def fetch_new_token(login: str, password: str):
         page = await context.new_page()
 
         try:
-            # 1) Idziemy na /api/ap (backend przekieruje na /logowanie jeśli trzeba)
             LOGGER.info("Opening: %s", EDUVULCAN_URL)
             await page.goto(EDUVULCAN_URL, wait_until="networkidle")
             await remove_privacy_overlay(page)
 
-            # Usuń overlay cookies (jeśli jest)
-            await page.evaluate("""
-                const el = document.getElementById("respect-privacy-wrapper");
-                if (el) el.remove();
-            """)
-
-            # 2) Sprawdź czy sesja już aktywna (czy istnieje #ap)
             try:
                 await page.wait_for_selector("#ap", timeout=5000)
-                LOGGER.info("Active session detected – token available without login")
+                LOGGER.info("Active session detected - token available without login")
             except Exception:
-                LOGGER.info("No active session – performing login flow")
+                LOGGER.info("No active session - performing login flow")
 
-                # Upewnij się, że jesteśmy faktycznie na stronie logowania
                 try:
-                    await page.wait_for_selector("#Alias", timeout=5000)
-                except Exception:
-                    LOGGER.warning("Login form not detected – clearing context and retrying fresh login")
+                    await fill_login_form(page, login, password)
+                except LoginFlowError as first_exc:
+                    LOGGER.warning(
+                        "Login flow failed on stored session (%s); clearing context and retrying fresh login",
+                        first_exc,
+                    )
+                    await save_page_diagnostics(page, "stored_session_login_failed")
 
-                    # Resetuj kontekst przeglądarki, aby usunąć potencjalnie uszkodzoną sesję
                     await context.close()
                     context = await browser.new_context()
                     page = await context.new_page()
                     await page.goto(EDUVULCAN_URL, wait_until="networkidle")
                     await remove_privacy_overlay(page)
+                    await fill_login_form(page, login, password)
 
-                    await page.wait_for_selector("#Alias", timeout=30000)
-
-                # Krok 1: login
-                await page.fill("#Alias", login)
-                await remove_privacy_overlay(page)
-                await page.click("#btNext")
-
-                # Krok 2: hasło
-                await page.wait_for_selector("#Password", timeout=30000)
-                await page.fill("#Password", password)
-
-                # Captcha (jeśli się pojawi)
-                try:
-                    await page.wait_for_selector("#captcha", state="visible", timeout=5000)
-                    await page.wait_for_function(
-                        "document.querySelector('#captcha-response') && document.querySelector('#captcha-response').value !== ''",
-                        timeout=30000
-                    )
-                except Exception:
-                    pass
-
-                await remove_privacy_overlay(page)
-                await page.click("#btLogOn")
-
-                # Czekamy aż backend zwróci stronę z #ap
-                await page.wait_for_selector("#ap", state="attached", timeout=30000) #30s
-
-            # 3) Odczyt tokena z #ap (jedyna prawidłowa metoda)
             token_json = await page.eval_on_selector("#ap", "el => el.value")
             data = json.loads(token_json)
 
-            tokens = data.get("Tokens") or []  # Tokens[] może być puste lub nieobecne
-            jwt = tokens[0] if tokens else None  # W praktyce pierwszy element to JWT
+            tokens = data.get("Tokens") or []
+            jwt = tokens[0] if tokens else None
             if not jwt:
+                await save_page_diagnostics(page, "jwt_missing_in_ap_response")
                 send_persistent_notification(
-                    title="EduVulcan Token Fetcher – błąd",
+                    title="EduVulcan Token Fetcher - blad",
                     message="Nie wykryto tokena JWT w odpowiedzi eduVULCAN.",
                     notification_id=ERROR_NOTIFICATION_ID,
                 )
@@ -266,9 +434,8 @@ async def fetch_new_token(login: str, password: str):
             payload = decode_jwt_payload(jwt)
             tenant = payload.get("tenant")
             if not tenant:
-                raise RuntimeError("Nie udało się odczytać tenant z JWT")
+                raise RuntimeError("Nie udalo sie odczytac tenant z JWT")
 
-            # 4) Zapis tokena do /config
             output = {
                 "tenant": tenant,
                 "jwt": jwt,
@@ -281,20 +448,22 @@ async def fetch_new_token(login: str, password: str):
                 json.dump(output, f, indent=2, ensure_ascii=False)
                 f.write("\n")
 
-            # 5) Zapis cookies / localStorage do /data
             await context.storage_state(path=STORAGE_FILE)
 
             LOGGER.info("Token saved to: %s", TOKEN_FILE)
             LOGGER.info("Storage saved to: %s", STORAGE_FILE)
             LOGGER.info("Done (tenant: %s)", tenant)
 
+        except Exception:
+            try:
+                await save_page_diagnostics(page, "fetch_new_token_failed")
+            except Exception:
+                pass
+            raise
         finally:
             await browser.close()
 
-# Usuwa nakładki prywatności/cookies blokujące interakcję z formularzem
-# Wejście: page (Playwright Page)
-# Wyjście: None (modyfikuje DOM strony)
-# Założenia/skutki: modyfikuje elementy DOM, aby umożliwić kliknięcia
+
 async def remove_privacy_overlay(page):
     await page.evaluate("""
         // Usuń główny wrapper
@@ -326,6 +495,7 @@ async def watchdog_loop(login: str, password: str):
     LOGGER.info("Starting JWT watchdog loop (refresh margin: %ss)", REFRESH_MARGIN)
 
     failures = 0
+    last_failure_reason = ""
 
     # Pętla nieskończona, która usypia między kolejnymi kontrolami ważności
     while True:
@@ -349,11 +519,15 @@ async def watchdog_loop(login: str, password: str):
             failures = 0  # reset po sukcesie
         except Exception as exc:
             failures += 1
+            last_failure_reason = str(exc) or exc.__class__.__name__
             LOGGER.exception("Refresh failed (%s/%s): %s", failures, MAX_FAILURES, exc)
 
             # Po przekroczeniu limitu kończymy pętlę i informujemy użytkownika
             if failures >= MAX_FAILURES:
                 msg = (
+                    f"Ostatni blad: {last_failure_reason}\n\n"
+                    "Diagnostyka, jesli udalo sie ja zapisac, jest w "
+                    "/data/eduvulcan_debug_*.html oraz /data/eduvulcan_debug_*.png.\n\n"
                     "Nie udało się odświeżyć tokena eduVULCAN po "
                     f"{failures} kolejnych próbach.\n\n"
                     "Sprawdź poprawność loginu/hasła, ewentualne captcha "
@@ -365,7 +539,7 @@ async def watchdog_loop(login: str, password: str):
                     notification_id=ERROR_NOTIFICATION_ID,
                 )
                 LOGGER.error("Max failures reached. Stopping watchdog loop.")
-                return
+                return 1
 
             # Nie pętlimy agresywnie przy błędzie
             await asyncio.sleep(FAIL_SLEEP)
@@ -404,7 +578,7 @@ async def main() -> int:
             LOGGER.info("Running in one-shot mode (--once)")
             await fetch_new_token(login, password)
         else:
-            await watchdog_loop(login, password)
+            return await watchdog_loop(login, password)
         return 0
     except Exception as exc:
         LOGGER.exception("Unexpected error: %s", exc)
